@@ -1,0 +1,20 @@
+# Large video files
+*.MP4
+*.mp4
+*.m4v
+*.mov
+*.avi
+
+# Large data directories (generated output)
+runner_data/
+continuous_output/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/

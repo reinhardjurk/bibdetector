@@ -1,0 +1,195 @@
+import cv2
+import easyocr
+import os
+from datetime import timedelta
+from collections import Counter
+from ultralytics import YOLO
+
+# --- Configuration ---
+VIDEO_PATH = 'test.long.m4v'  
+OUTPUT_DIR = 'runner_images' 
+HTML_FILE = 'race_results.html'
+FRAME_SKIP = 3               # Process every 3rd frame
+PATIENCE_FRAMES = 30         # Wait 30 frames after losing a track before processing
+CONFIDENCE_THRESHOLD = 0.5   
+
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+# --- HTML Initialization ---
+with open(HTML_FILE, 'w', encoding='utf-8') as f:
+    f.write("""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Race - Live Tracking</title>
+        <style>
+            body { font-family: Arial, sans-serif; background-color: #f4f4f9; padding: 20px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; background: white; }
+            th, td { padding: 12px; border: 1px solid #ddd; text-align: left; vertical-align: middle; }
+            th { background-color: #007BFF; color: white; }
+            img { max-width: 300px; border-radius: 5px; }
+        </style>
+    </head>
+    <body>
+        <h1>Detected Runners (Tracked)</h1>
+        <table>
+            <tr>
+                <th>Bib Number</th>
+                <th>Time (hh:mm:ss.ms)</th>
+                <th>Snapshot</th>
+            </tr>
+    """)
+
+def append_to_html(number, timestamp_str, img_filename):
+    with open(HTML_FILE, 'a', encoding='utf-8') as f:
+        f.write(f"""
+            <tr>
+                <td><strong>{number}</strong></td>
+                <td>{timestamp_str}</td>
+                <td><img src="{OUTPUT_DIR}/{img_filename}" alt="Bib {number}"></td>
+            </tr>
+        """)
+
+# --- Model Initialization ---
+print("Loading YOLOv8 tracking model...")
+yolo_model = YOLO('yolov8n.pt') 
+
+print("Loading EasyOCR model...")
+reader = easyocr.Reader(['en'], gpu=True) 
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+fps = cap.get(cv2.CAP_PROP_FPS)
+
+# active_tracks structure: 
+# { track_id: { 'sightings': [], 'last_seen_frame': int } }
+# A sighting is a tuple: (frame_copy, timestamp_str, absolute_bbox, clean_number)
+active_tracks = {} 
+processed_track_ids = set() 
+frame_idx = 0
+
+print("Starting video tracking & analysis...")
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+        
+    frame_idx += 1
+    current_time_sec = frame_idx / fps
+    current_timestamp_str = str(timedelta(seconds=current_time_sec))[:-3]
+
+    if frame_idx % FRAME_SKIP != 0:
+        continue
+
+    # 1. Run YOLO Tracking (persist=True tells it to remember IDs across frames)
+    # Using 'bytetrack.yaml' which is built-in and excellent for pedestrians
+    yolo_results = yolo_model.track(
+        frame, 
+        persist=True, 
+        classes=[0], 
+        tracker="bytetrack.yaml", 
+        device='mps', 
+        verbose=False
+    )
+
+    # Check if there are any detections and if they have track IDs assigned
+    if yolo_results[0].boxes is not None and yolo_results[0].boxes.id is not None:
+        boxes = yolo_results[0].boxes.xyxy.cpu().numpy()
+        track_ids = yolo_results[0].boxes.id.int().cpu().tolist()
+
+        for box, track_id in zip(boxes, track_ids):
+            if track_id in processed_track_ids:
+                continue
+
+            px1, py1, px2, py2 = map(int, box)
+            
+            # Bound checks
+            h, w = frame.shape[:2]
+            px1, py1 = max(0, px1), max(0, py1)
+            px2, py2 = min(w, px2), min(h, py2)
+
+            # Ignore people too small / too far away
+            if (px2 - px1) < 60 or (py2 - py1) < 120:
+                continue
+
+            person_crop = frame[py1:py2, px1:px2]
+
+            # 2. Run OCR on the crop
+            ocr_results = reader.readtext(person_crop)
+
+            found_bibs_in_crop = []
+            for (ocr_bbox, text, prob) in ocr_results:
+                clean_number = ''.join(filter(str.isdigit, text))
+                
+                if clean_number and prob > CONFIDENCE_THRESHOLD:
+                    # Translate cropped coordinates to absolute frame coordinates
+                    abs_p1 = (int(ocr_bbox[0][0]) + px1, int(ocr_bbox[0][1]) + py1)
+                    abs_p2 = (int(ocr_bbox[2][0]) + px1, int(ocr_bbox[2][1]) + py1)
+                    absolute_bbox = [abs_p1, abs_p2]
+                    
+                    found_bibs_in_crop.append((absolute_bbox, clean_number))
+
+            # Update the track data
+            if track_id not in active_tracks:
+                active_tracks[track_id] = {'sightings': [], 'last_seen_frame': frame_idx}
+            
+            active_tracks[track_id]['last_seen_frame'] = frame_idx
+            
+            # If we successfully read a bib on this frame, save the data
+            for bbox, number in found_bibs_in_crop:
+                active_tracks[track_id]['sightings'].append(
+                    (frame.copy(), current_timestamp_str, bbox, number)
+                )
+
+    # --- 3. Pruning: Process tracks that left the camera view ---
+    tracks_to_process = []
+    for t_id, data in active_tracks.items():
+        if (frame_idx - data['last_seen_frame']) > PATIENCE_FRAMES:
+            tracks_to_process.append(t_id)
+
+    for t_id in tracks_to_process:
+        data = active_tracks[t_id]
+        sightings = data['sightings']
+        
+        # Only process if we actually saw a bib during this track
+        if len(sightings) > 0:
+            # --- MAJORITY VOTING ---
+            # Count all read numbers for this person to find the most common one
+            all_numbers = [s[3] for s in sightings]
+            most_common_number = Counter(all_numbers).most_common(1)[0][0]
+            
+            # Filter sightings to only those where the correct number was read
+            valid_sightings = [s for s in sightings if s[3] == most_common_number]
+            
+            # Get the median sighting based on time
+            mid_index = len(valid_sightings) // 2
+            best_frame, best_timestamp, best_bbox, final_number = valid_sightings[mid_index]
+            
+            # Draw on the frame
+            p1, p2 = best_bbox
+            cv2.rectangle(best_frame, p1, p2, (0, 255, 0), 3)
+            cv2.rectangle(best_frame, (p1[0], p1[1] - 40), (p1[0] + 150, p1[1]), (0, 255, 0), -1)
+            
+            label = f"Bib: {final_number} | {best_timestamp}"
+            cv2.putText(best_frame, label, (p1[0] + 5, p1[1] - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+            
+            # Export
+            img_filename = f"runner_{final_number}_{best_timestamp.replace(':', '-')}.jpg"
+            cv2.imwrite(os.path.join(OUTPUT_DIR, img_filename), best_frame)
+            append_to_html(final_number, best_timestamp, img_filename)
+            
+            print(f"-> Track ID {t_id}: Runner {final_number} captured via voting! (Time: {best_timestamp})")
+        
+        # Cleanup
+        processed_track_ids.add(t_id)
+        del active_tracks[t_id]
+
+# HTML closure
+with open(HTML_FILE, 'a', encoding='utf-8') as f:
+    f.write("</table></body></html>")
+
+cap.release()
+print("Analysis complete. Open 'race_results.html' in your browser.")

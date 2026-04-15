@@ -1,0 +1,218 @@
+import cv2
+import easyocr
+import os
+from datetime import timedelta
+from ultralytics import YOLO
+
+# --- Configuration ---
+VIDEO_PATH = 'test.long.m4v'  
+OUTPUT_DIR = 'runner_data'   # Renamed to data, as it now holds images and m3u files
+HTML_FILE = 'race_results.html'
+FRAME_SKIP = 2               
+PATIENCE_FRAMES = 30         
+CONFIDENCE_THRESHOLD = 0.5   
+MIN_CONSECUTIVE_DETECTIONS = 2 # The bib must be read identically X times in a row
+
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
+
+# Get the absolute path for the VLC playlist
+ABS_VIDEO_PATH = os.path.abspath(VIDEO_PATH)
+
+# --- HTML Initialization ---
+with open(HTML_FILE, 'w', encoding='utf-8') as f:
+    f.write("""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Race - Live Tracking</title>
+        <style>
+            body { font-family: Arial, sans-serif; background-color: #f4f4f9; padding: 20px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; background: white; }
+            th, td { padding: 12px; border: 1px solid #ddd; text-align: left; vertical-align: middle; }
+            th { background-color: #007BFF; color: white; }
+            img { max-width: 300px; border-radius: 5px; }
+            .vlc-btn { background-color: #ff8800; color: white; padding: 10px 15px; text-decoration: none; border-radius: 5px; font-weight: bold; }
+            .vlc-btn:hover { background-color: #cc6c00; }
+        </style>
+    </head>
+    <body>
+        <h1>Detected Runners</h1>
+        <table>
+            <tr>
+                <th>Bib Number</th>
+                <th>Time (hh:mm:ss)</th>
+                <th>Snapshot</th>
+                <th>Playback</th>
+            </tr>
+    """)
+
+def append_to_html(number, timestamp_str, img_filename, m3u_filename):
+    with open(HTML_FILE, 'a', encoding='utf-8') as f:
+        f.write(f"""
+            <tr>
+                <td><strong>{number}</strong></td>
+                <td>{timestamp_str}</td>
+                <td><img src="{OUTPUT_DIR}/{img_filename}" alt="Bib {number}"></td>
+                <td><a href="{OUTPUT_DIR}/{m3u_filename}" class="vlc-btn">▶ Play in VLC</a></td>
+            </tr>
+        """)
+
+def create_m3u_playlist(m3u_path, start_time_sec):
+    """Generates an M3U file that tells VLC to start at a specific time."""
+    with open(m3u_path, 'w', encoding='utf-8') as f:
+        f.write("#EXTM3U\n")
+        f.write(f"#EXTVLCOPT:start-time={start_time_sec}\n")
+        f.write(f"file://{ABS_VIDEO_PATH}\n")
+
+# --- Model Initialization ---
+print("Loading YOLOv8 tracking model...")
+yolo_model = YOLO('yolov8n.pt') 
+
+print("Loading EasyOCR model...")
+reader = easyocr.Reader(['en'], gpu=True) 
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+fps = cap.get(cv2.CAP_PROP_FPS)
+
+active_tracks = {} 
+processed_track_ids = set() 
+globally_completed_bibs = set() # NEW: Ensures each bib is only ever exported once
+frame_idx = 0
+
+print("Starting video analysis...")
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+    print(frame_idx)     
+    frame_idx += 1
+    current_time_sec = frame_idx / fps
+    current_timestamp_str = str(timedelta(seconds=current_time_sec))[:-3]
+
+    if frame_idx % FRAME_SKIP != 0:
+        continue
+
+    # 1. Run YOLO Tracking
+    yolo_results = yolo_model.track(
+        frame, persist=True, classes=[0], tracker="bytetrack.yaml", device='mps', verbose=False
+    )
+
+    if yolo_results[0].boxes is not None and yolo_results[0].boxes.id is not None:
+        boxes = yolo_results[0].boxes.xyxy.cpu().numpy()
+        track_ids = yolo_results[0].boxes.id.int().cpu().tolist()
+
+        for box, track_id in zip(boxes, track_ids):
+            if track_id in processed_track_ids:
+                continue
+
+            px1, py1, px2, py2 = map(int, box)
+            h, w = frame.shape[:2]
+            px1, py1 = max(0, px1), max(0, py1)
+            px2, py2 = min(w, px2), min(h, py2)
+
+            if (px2 - px1) < 60 or (py2 - py1) < 120:
+                continue
+
+            person_crop = frame[py1:py2, px1:px2]
+            ocr_results = reader.readtext(person_crop)
+
+            found_bibs_in_crop = []
+            for (ocr_bbox, text, prob) in ocr_results:
+                clean_number = ''.join(filter(str.isdigit, text))
+                
+                # If we've already globally logged this bib, don't even bother tracking it again
+                if clean_number in globally_completed_bibs:
+                    continue
+
+                if clean_number and prob > CONFIDENCE_THRESHOLD:
+                    abs_p1 = (int(ocr_bbox[0][0]) + px1, int(ocr_bbox[0][1]) + py1)
+                    abs_p2 = (int(ocr_bbox[2][0]) + px1, int(ocr_bbox[2][1]) + py1)
+                    absolute_bbox = [abs_p1, abs_p2]
+                    
+                    found_bibs_in_crop.append((absolute_bbox, clean_number))
+
+            if track_id not in active_tracks:
+                active_tracks[track_id] = {'sightings': [], 'last_seen_frame': frame_idx}
+            
+            active_tracks[track_id]['last_seen_frame'] = frame_idx
+            
+            for bbox, number in found_bibs_in_crop:
+                active_tracks[track_id]['sightings'].append(
+                    (frame.copy(), current_timestamp_str, bbox, number, current_time_sec)
+                )
+
+    # --- 2. Pruning & Consecutive Logic ---
+    tracks_to_process = []
+    for t_id, data in active_tracks.items():
+        if (frame_idx - data['last_seen_frame']) > PATIENCE_FRAMES:
+            tracks_to_process.append(t_id)
+
+    for t_id in tracks_to_process:
+        data = active_tracks[t_id]
+        sightings = data['sightings']
+        
+        if len(sightings) >= MIN_CONSECUTIVE_DETECTIONS:
+            # Check for consecutive detections to filter out random OCR noise
+            best_num = None
+            max_consecutive = 0
+            current_num = None
+            current_count = 0
+            
+            for s in sightings:
+                num = s[3] 
+                if num == current_num:
+                    current_count += 1
+                else:
+                    if current_count > max_consecutive:
+                        max_consecutive = current_count
+                        best_num = current_num
+                    current_num = num
+                    current_count = 1
+            
+            if current_count > max_consecutive:
+                max_consecutive = current_count
+                best_num = current_num
+
+            # Only proceed if the number was seen consecutively enough times
+            # AND it hasn't been globally recorded yet (handles double-tracks of the same person)
+            if max_consecutive >= MIN_CONSECUTIVE_DETECTIONS and best_num not in globally_completed_bibs:
+                
+                valid_sightings = [s for s in sightings if s[3] == best_num]
+                mid_index = len(valid_sightings) // 2
+                best_frame, best_timestamp, best_bbox, final_number, best_time_sec = valid_sightings[mid_index]
+                
+                # Draw on frame
+                p1, p2 = best_bbox
+                cv2.rectangle(best_frame, p1, p2, (0, 255, 0), 3)
+                cv2.rectangle(best_frame, (p1[0], p1[1] - 40), (p1[0] + 150, p1[1]), (0, 255, 0), -1)
+                
+                label = f"Bib: {final_number} | {best_timestamp}"
+                cv2.putText(best_frame, label, (p1[0] + 5, p1[1] - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                
+                # File names
+                img_filename = f"runner_{final_number}.jpg"
+                m3u_filename = f"play_{final_number}.m3u"
+                
+                # Exports
+                cv2.imwrite(os.path.join(OUTPUT_DIR, img_filename), best_frame)
+                create_m3u_playlist(os.path.join(OUTPUT_DIR, m3u_filename), best_time_sec - 2.0) # Start video 2 seconds before detection
+                append_to_html(final_number, best_timestamp, img_filename, m3u_filename)
+                
+                print(f"-> Verified Bib {final_number} ({max_consecutive} consecutive hits). Saved!")
+                
+                # Add to global set to guarantee uniqueness across the whole video
+                globally_completed_bibs.add(final_number)
+        
+        processed_track_ids.add(t_id)
+        del active_tracks[t_id]
+
+with open(HTML_FILE, 'a', encoding='utf-8') as f:
+    f.write("</table></body></html>")
+
+cap.release()
+print(f"Total unique runners identified: {len(globally_completed_bibs)}")
+print("Analysis complete. Open 'race_results.html' in your browser.")
